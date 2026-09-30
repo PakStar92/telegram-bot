@@ -1,15 +1,15 @@
 {
   "bot": {
-    "name": "My Modern Bot",
-    "username": "MyModernBot",
+    "name": "Kraken",
+    "username": "gtech-bot",
     "description": "A modern, feature-rich Telegram bot with inline menus, customizable settings, and more.",
-    "version": "1.0.0",
-    "photo": "https://i.ibb.co/5Wc1R5D0/1784490428744.png",
-    "startupMessage": ""
+    "version": "2.0.0",
+    "photo": "https://ibb.co/TxY0Vwnw",
+    "startupMessage": "Kraken Is Awake"
   },
   "owner": {
-    "name": "Bot Owner",
-    "username": "@owner",
+    "name": "Global Tech",
+    "username": "@GlobalTechOwner",
     "id": 0
   },
   "timezone": "Asia/Karachi",
@@ -270,7 +270,7 @@
   "apiBaseUrl": "https://api.qasimdev.dpdns.org/api",
   "apiKey": "qasim-dev",
   "ui": {
-    "prefix": "🤖 My Modern Bot",
+    "prefix": "🤖 Kraken",
     "mainMenu": {
       "cols": 2,
       "buttons": [
