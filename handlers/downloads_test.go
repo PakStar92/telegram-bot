@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -133,10 +136,12 @@ func TestDlByHostMatching(t *testing.T) {
 		{"https://x.com/user/status/1", "tw"},
 		{"https://t.co/abc", "tw"},
 		{"https://twitter.com/user/status/1", "tw"},
+		{"https://open.spotify.com/track/abc", "spotify"},
 		// Lookalike hosts must not match.
 		{"https://notyoutube.com/watch?v=abc", ""},
 		{"https://youtube.com.evil.io/watch", ""},
 		{"https://evil-instagram.com/p/ABC/", ""},
+		{"https://notspotify.com/track/abc", ""},
 		{"https://example.com/video", ""},
 		{"not a url", ""},
 		{"", ""},
@@ -461,6 +466,260 @@ func TestYoutubeDeliversChosenFileNotThumbnail(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A Spotify response carries the cover art beside the file, and the file URL is
+// an extensionless proxy, so the same trap as YouTube applies: the track must
+// be what goes out, as audio.
+func TestSpotifySendsTrackNotCover(t *testing.T) {
+	api := &stubAPI{responders: map[string][]string{
+		"getMe":       {okMe},
+		"sendAudio":   {`{"ok":true,"result":{}}`},
+		"sendMessage": {`{"ok":true,"result":{}}`},
+	}}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/tunnel":
+			w.Header().Set("Content-Type", "audio/mpeg")
+			w.Write([]byte{0xFF, 0xFB, 0x90, 0x00})
+		case "/cover.png":
+			w.Header().Set("Content-Type", "image/png")
+			w.Write([]byte("\x89PNG\r\n\x1a\n"))
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": true,
+				"data": map[string]interface{}{
+					"type":     "spotify",
+					"title":    "Rick Astley - Never Gonna Give You Up",
+					"artist":   "Rick Astley",
+					"cover":    srvHost(r) + "/cover.png",
+					"download": srvHost(r) + "/tunnel?id=1&redirect=1",
+					"duration": "3:34",
+					"format":   "mp3",
+				},
+				"cached": false,
+			})
+		}
+	}))
+	defer srv.Close()
+
+	h := igHandler(t, api, srv.URL)
+	d, _ := dlByID("spotify")
+	h.resolveDownload(d, -1001, -1001, "https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT", "", "en")
+
+	if n := len(api.callsFor("sendAudio")); n != 1 {
+		t.Errorf("want the track sent once, got %d sendAudio calls", n)
+	}
+	if n := len(api.callsFor("sendPhoto")); n != 0 {
+		t.Errorf("the cover must never be sent, got %d photos", n)
+	}
+	if n := len(api.callsFor("sendMediaGroup")); n != 0 {
+		t.Errorf("one track is not a carousel, got %d albums", n)
+	}
+}
+
+// Likee names its two copies of the same video differently and puts a poster
+// beside them. The watermark-free copy must be what goes out.
+func TestLikeeSendsWatermarkFreeVideo(t *testing.T) {
+	api := &stubAPI{responders: map[string][]string{
+		"getMe":       {okMe},
+		"sendVideo":   {`{"ok":true,"result":{}}`},
+		"sendMessage": {`{"ok":true,"result":{}}`},
+	}}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, ".mp4") {
+			w.Header().Set("Content-Type", "video/mp4")
+			w.Write([]byte{0, 0, 0, 0x18, 'f', 't', 'y', 'p'})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"data": map[string]interface{}{
+				"title":            "Trendy Video of the Week!",
+				"thumbnail":        srvHost(r) + "/poster.jpg",
+				"withoutwatermark": srvHost(r) + "/clean.mp4?crc=1&type=5",
+				"withWatermark":    srvHost(r) + "/wm.mp4?crc=1&type=5",
+			},
+		})
+	}))
+	defer srv.Close()
+
+	h := igHandler(t, api, srv.URL)
+	d, _ := dlByID("likee")
+	h.resolveDownload(d, -1001, -1001, "https://l.likee.video/v/DnCl4V.html", "", "en")
+
+	if n := len(api.callsFor("sendVideo")); n != 1 {
+		t.Errorf("want one video sent, got %d sendVideo calls", n)
+	}
+	if n := len(api.callsFor("sendPhoto")); n != 0 {
+		t.Errorf("the poster must never be sent, got %d photos", n)
+	}
+}
+
+// The endpoint refuses the bare domain, so those links must be reported as
+// unsupported rather than sent to fail there.
+func TestLikeeRejectsUnsupportedLinkShapes(t *testing.T) {
+	for _, bad := range []string{
+		"https://likee.video/v/DnCl4V",
+		"https://www.likee.video/v/DnCl4V.html",
+		"https://l.likee.video/@user/video/123",
+		"https://l.likee.video/community",
+	} {
+		if hit := dlByHost(bad); !hit.offPath || hit.d.id != "likee" {
+			t.Errorf("%s should be offPath for likee, got ok=%v id=%q", bad, hit.ok, hit.d.id)
+		}
+	}
+	for _, good := range []string{
+		"https://l.likee.video/v/DnCl4V.html",
+		"https://l.likee.video/v/DnCl4V",
+		"https://l.likee.video/v/DnCl4V?share_id=1",
+	} {
+		if hit := dlByHost(good); !hit.ok {
+			t.Errorf("%s should be accepted, got %+v", good, hit)
+		}
+	}
+}
+
+// SoundCloud answers with an HLS playlist rather than a file, so the track has
+// to be resolved with ffmpeg before it can be sent, and it must go out as audio.
+func TestSoundCloudResolvesPlaylistToAudio(t *testing.T) {
+	api := &stubAPI{responders: map[string][]string{
+		"getMe":       {okMe},
+		"sendAudio":   {`{"ok":true,"result":{}}`},
+		"sendMessage": {`{"ok":true,"result":{}}`},
+	}}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"data": map[string]interface{}{
+				"id":      293,
+				"title":   "Flickermood",
+				"artist":  "Forss",
+				"artwork": srvHost(r) + "/art.jpg",
+				"downloadUrl": srvHost(r) + "/playlist.m3u8" +
+					"?Expires=1&Policy=abc&Signature=xyz&Key-Pair-Id=K1",
+				"format":   "audio/mp4; codecs=\"mp4a.40.2\"",
+				"protocol": "hls",
+			},
+		})
+	}))
+	defer srv.Close()
+
+	h := igHandler(t, api, srv.URL)
+	d, _ := dlByID("soundcloud")
+	old := ffmpegPath
+	ffmpegPath = fakeFFmpeg(t)
+	defer func() { ffmpegPath = old }()
+
+	h.resolveDownload(d, -1001, -1001, "https://soundcloud.com/forss/flickermood", "", "en")
+
+	if n := len(api.callsFor("sendAudio")); n != 1 {
+		t.Errorf("want the track sent once, got %d sendAudio calls", n)
+	}
+	if n := len(api.callsFor("sendPhoto")); n != 0 {
+		t.Errorf("the artwork must never be sent, got %d photos", n)
+	}
+	if n := len(api.callsFor("sendMediaGroup")); n != 0 {
+		t.Errorf("one track is not a carousel, got %d albums", n)
+	}
+}
+
+// The real thing: ffmpeg resolving a playlist into one audio file. SoundCloud
+// hands back a .m3u8, so this is the only path that can deliver one, and a stub
+// would not prove it. Skipped where ffmpeg is absent, which is also when the
+// site is hidden from the menu.
+func TestFetchHLSResolvesAPlaylist(t *testing.T) {
+	bin := resolveFFmpeg("")
+	if bin == "" {
+		t.Skip("ffmpeg is not installed")
+	}
+	old := ffmpegPath
+	ffmpegPath = bin
+	defer func() { ffmpegPath = old }()
+
+	dir := t.TempDir()
+	build := exec.Command(bin, "-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+		"-c:a", "aac", "-f", "hls", "-hls_time", "1", "-hls_playlist_type", "vod",
+		"-hls_list_size", "0", "-hls_segment_filename", filepath.Join(dir, "seg%d.ts"), filepath.Join(dir, "p.m3u8"))
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Skipf("cannot build a fixture playlist: %v %s", err, out)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := os.ReadFile(filepath.Join(dir, filepath.Base(r.URL.Path)))
+		if err != nil {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Write(body)
+	}))
+	defer srv.Close()
+
+	body, ct, err := fetchHLS(srv.URL + "/p.m3u8")
+	if err != nil {
+		t.Fatalf("fetchHLS: %v", err)
+	}
+	if len(body) == 0 {
+		t.Fatal("fetchHLS returned nothing")
+	}
+	if ct != "audio/mp4" {
+		t.Errorf("content type %q, want audio/mp4", ct)
+	}
+	if !sniffVideo(body) {
+		t.Error("output is not an MP4 container")
+	}
+}
+
+// fakeFFmpeg stands in for the real binary: it records the output path it was
+// asked for and writes a short AAC header there. The playlist URL never has to
+// be fetchable, so the test does not depend on a live SoundCloud CDN.
+func fakeFFmpeg(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	script := filepath.Join(dir, "ffmpeg")
+	body := "#!/bin/sh\n" +
+		"for a in \"$@\"; do case \"$a\" in -*) ;; *) last=\"$a\";; esac; done\n" +
+		"printf '\\000\\000\\000\\x18ftypM4A ' > \"$last\"\n" +
+		"echo \"$last\" > \"" + filepath.Join(dir, "outpath") + "\"\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatalf("fake ffmpeg: %v", err)
+	}
+	return script
+}
+
+// A site that cannot be delivered without ffmpeg must not appear on the menu
+// when ffmpeg is missing.
+func TestHlsSiteHiddenWithoutFFmpeg(t *testing.T) {
+	h, _, _ := newSiteFixture(t, "gh",
+		func(string) map[string]interface{} { return map[string]interface{}{"success": true} },
+		"application/zip", nil, map[string][]string{})
+
+	old := ffmpegPath
+	defer func() { ffmpegPath = old }()
+
+	ffmpegPath = ""
+	if hasButton(h, "soundcloud") {
+		t.Error("soundcloud must be hidden when ffmpeg is unavailable")
+	}
+	ffmpegPath = "/usr/bin/ffmpeg"
+	if !hasButton(h, "soundcloud") {
+		t.Error("soundcloud must be shown when ffmpeg is available")
+	}
+}
+
+func hasButton(h *Handler, id string) bool {
+	for _, row := range h.downloadMenu("en").InlineKeyboard {
+		for _, b := range row {
+			if cb(b) == "dl_"+id {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Facebook keeps its image-as-document quirk and its info block.

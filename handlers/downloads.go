@@ -1,11 +1,14 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"os/exec"
 	"regexp"
 	"strings"
 	"time"
@@ -155,6 +158,11 @@ type downloader struct {
 	// GitHub's only takes owner/repo, so everything else is reported as
 	// unsupported instead of being sent to the API to fail there.
 	match func(u *url.URL) bool
+	// hls marks an endpoint that hands back a playlist rather than a file.
+	// SoundCloud answers with a .m3u8 and no streamable media URL, and a
+	// playlist is a list of segment references, so it is resolved with ffmpeg
+	// into one file before delivery. Sites without it are fetched directly.
+	hls bool
 }
 
 var downloaders = []downloader{
@@ -162,7 +170,7 @@ var downloaders = []downloader{
 		id: "yt", name: "YouTube", cmds: []string{"yt", "download"},
 		hosts:    []string{"youtube.com", "youtu.be", "m.youtube.com"},
 		endpoint: "/loaderto/download", mode: dlFormats, key: "format",
-		options: ytOptions,
+		options: fileOption,
 		labels: []dlLabel{
 			{"mp3", "ytFormatMp3", "MP3"},
 			{"360", "ytFormat360", "360p"},
@@ -232,6 +240,23 @@ var downloaders = []downloader{
 		endpoint: "/twitter/download", mode: dlList,
 		caption:      twCaption,
 		mediaCaption: true,
+	},
+	{
+		id: "spotify", name: "Spotify", cmds: []string{"spotify"},
+		hosts:    []string{"spotify.com"},
+		endpoint: "/spotify/download", mode: dlSingle, options: fileOption,
+	},
+	{
+		id: "likee", name: "Likee", cmds: []string{"likee"},
+		hosts:    []string{"likee.video"},
+		endpoint: "/likee/download", mode: dlSingle,
+		options: likeeOptions, match: likeeCode,
+	},
+	{
+		id: "soundcloud", name: "SoundCloud", cmds: []string{"soundcloud"},
+		hosts:    []string{"soundcloud.com"},
+		endpoint: "/soundcloud/download", mode: dlSingle,
+		options: fileOption, hls: true,
 	},
 
 	{
@@ -931,6 +956,50 @@ func itemLabel(d downloader, item interface{}, i int) string {
 	return fmt.Sprintf("%s %d", d.name, i+1)
 }
 
+// fetchHLS resolves a playlist into a single audio file with ffmpeg.
+//
+// ffmpeg fetches the playlist itself rather than going through mediaClient:
+// the playlist is a few kilobytes of segment references, and letting it do the
+// fetching avoids buffering the whole track in Go only to hand it straight back.
+// The output is AAC in MP4 because Telegram takes that for an audio file, and
+// two threads because the conversion is CPU-bound and runs beside everything
+// else the bot is doing.
+func fetchHLS(playlistURL string) ([]byte, string, error) {
+	if !ffmpegAvailable() {
+		return nil, "", fmt.Errorf("ffmpeg is not available")
+	}
+	outPath, err := tempFile("hls", ".m4a")
+	if err != nil {
+		return nil, "", err
+	}
+	defer os.Remove(outPath)
+
+	args := []string{"-hide_banner", "-loglevel", "error", "-y", "-threads", "2",
+		"-i", playlistURL, "-vn", "-c:a", "aac", "-b:a", "128k", outPath}
+
+	ctx, cancel := context.WithTimeout(context.Background(), ffmpegTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, ffmpegPath, args...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, "", fmt.Errorf("hls: timed out after %s", ffmpegTimeout)
+		}
+		msg := strings.TrimSpace(string(out))
+		if len(msg) > 200 {
+			msg = msg[:200]
+		}
+		return nil, "", fmt.Errorf("hls: %v %s", err, msg)
+	}
+	res, err := os.ReadFile(outPath)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(res) == 0 {
+		return nil, "", fmt.Errorf("hls produced nothing")
+	}
+	return res, "audio/mp4", nil
+}
+
 // deliver sends one resolved option, choosing between a video, an album of
 // images and a single file from what it holds.
 func (h *Handler) deliver(chatID int64, d downloader, o dlOption, lang string) {
@@ -959,7 +1028,16 @@ func (h *Handler) deliver(chatID int64, d downloader, o dlOption, lang string) {
 	}
 
 	h.acquireDL()
-	body, ct, err := fetchMedia(items[0].url)
+	var (
+		body []byte
+		ct   string
+		err  error
+	)
+	if d.hls {
+		body, ct, err = fetchHLS(items[0].url)
+	} else {
+		body, ct, err = fetchMedia(items[0].url)
+	}
 	h.releaseDL()
 	if err != nil {
 		log.Printf("%s download failed: %v", d.id, err)
@@ -1244,20 +1322,35 @@ func (h *Handler) handleDownloadPick(d downloader, chatID, uid int64, sel string
 	h.deliver(chatID, d, opts[idx], lang)
 }
 
-// ytOptions reads the single file the chosen format asked for.
+// fileOption reads the single file a per-file endpoint returns.
 //
-// The response also carries a poster and a source endpoint, and the generic
-// walker collects both as post media. The file URL is a proxy whose path ends
-// at "/loaderto/file" with the real extension in the f= query parameter, so
-// isVideoItem does not recognise it, primaryMedia keeps all three, and the
-// carousel path then drops the file as a video and delivers the thumbnail.
-func ytOptions(d downloader, v interface{}, lang string) []dlOption {
+// These endpoints answer with the file plus a poster and a source endpoint,
+// and collectURLs takes all three as post media. The file URL is a proxy whose
+// path has no extension, so isVideoItem never sees a video, primaryMedia keeps
+// everything, and the carousel path then drops the file and delivers the poster
+// instead. Only the registry knows which field is the file.
+func fileOption(d downloader, v interface{}, lang string) []dlOption {
 	data, _ := v.(map[string]interface{})["data"].(map[string]interface{})
-	file, _ := data["downloadUrl"].(string)
-	if file == "" {
+	for _, k := range []string{"downloadUrl", "download", "url", "file", "media"} {
+		f, _ := data[k].(string)
+		if strings.HasPrefix(f, "http") {
+			return []dlOption{{mediaURL: f, items: []mediaItem{{url: f}}}}
+		}
+	}
+	return nil
+}
+
+// likeeOptions picks the watermark-free file. Likee names its two copies of the
+// same video differently and puts a poster beside them, so it cannot use
+// fileOption: both files sit in the post, and the carousel path skips them both
+// because they are videos, which leaves an empty album.
+func likeeOptions(d downloader, v interface{}, lang string) []dlOption {
+	data, _ := v.(map[string]interface{})["data"].(map[string]interface{})
+	f, _ := data["withoutwatermark"].(string)
+	if !strings.HasPrefix(f, "http") {
 		return nil
 	}
-	return []dlOption{{mediaURL: file, items: []mediaItem{{url: file}}}}
+	return []dlOption{{mediaURL: f, items: []mediaItem{{url: f}}}}
 }
 
 // fbOptions reads Facebook's allQualities list, falling back to the single
@@ -1359,6 +1452,18 @@ var ghReserved = map[string]bool{
 	"settings": true, "stargazers": true, "forks": true, "network": true,
 	"commit": true, "commits": true, "notifications": true, "explore": true,
 	"sponsors": true, "discussions": true, "codespaces": true, "marketplace": true,
+}
+
+// likeeCode accepts only l.likee.video/v/<code>, with or without the .html
+// suffix. Verified against the endpoint: the bare domain and the www form are
+// both refused there, and those are the forms most share links use, so the user
+// is told which one to paste instead of watching the request fail.
+func likeeCode(u *url.URL) bool {
+	if u.Hostname() != "l.likee.video" {
+		return false
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	return len(parts) == 2 && parts[0] == "v" && parts[1] != ""
 }
 
 // ghRepoPath accepts only github.com/owner/repo, with or without a .git suffix.
